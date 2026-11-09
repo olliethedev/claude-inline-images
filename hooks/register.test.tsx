@@ -133,3 +133,17 @@ test('leaves an expanded group and a JPEG read to the engine', async ($, on) => 
     await ui.unmount()
   }
 })
+
+test('draws the original PNG when Claude re-encoded the read as JPEG', async ($, on) => {
+  engine(on)
+  const paths: string[] = []
+  on('fs.read', ($, e) => {
+    paths.push(e.path)
+    return { value: { base64: TINY_PNG } }
+  })
+  const ui = await $.ui.mount(group('image/jpeg'))
+
+  expect(paths).toEqual(['/tmp/test.png'])
+  expect(await ui.find({ type: 'Image' })).toBeTruthy()
+  await ui.unmount()
+})

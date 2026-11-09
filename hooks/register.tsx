@@ -5,6 +5,7 @@ type TReadOutput = BuiltinToolResults['Read']
 type TAttachment = TOutput['attachments'][number]
 type TSize = { width: number; height: number }
 type TPicture = { size: TSize | null; png: string | null }
+type TFs = { fs: { read: (path: string, options: { as: 'bytes' }) => Promise<{ base64: string }> } }
 
 const MAX_COLUMNS = 80
 const MAX_ROWS = 30
@@ -100,16 +101,42 @@ const readImage = (output: unknown, path?: string): TReadImage | null => {
   return size ? { base64, size, path } : null
 }
 
+// Claude re-encodes large PNG reads (for the model) as JPEG; draw the original file instead.
+const readOriginalPng = async ($: TFs, output: unknown, path?: string): Promise<TReadImage | null> => {
+  const read = output as TReadOutput | undefined
+  if (!read || read.type !== 'image' || !path?.startsWith('/') || !/\.png$/i.test(path)) return null
+  if (read.file.originalSize > MAX_INLINE_BYTES) return null
+
+  const key = `${path}:${read.file.originalSize}`
+  if (!pictures.has(key)) {
+    try {
+      const { base64 } = await $.fs.read(path, { as: 'bytes' })
+      const size = pngSize(base64)
+      remember(key, { size, png: size && (base64.length * 3) / 4 <= MAX_INLINE_BYTES ? base64 : null })
+    } catch {
+      remember(key, { size: null, png: null })
+    }
+  }
+
+  const picture = pictures.get(key)
+  return picture?.png && picture.size ? { base64: picture.png, size: picture.size, path } : null
+}
+
+const imageFor = async ($: TFs, output: unknown, path?: string) =>
+  readImage(output, path) ?? (await readOriginalPng($, output, path))
+
 export const register: Register = on => {
   on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
     if (e.surface !== 'terminal' || e.props.isExpanded) return next(e)
 
-    const images = e.props.calls.flatMap(call => {
-      if (call.tool !== 'Read' || call.isRunning || call.isErrored || call.isInterrupted) return []
-      const path = (call.input as { file_path?: string } | undefined)?.file_path
-      const image = readImage(call.output, path)
-      return image ? [image] : []
-    })
+    const found = await Promise.all(
+      e.props.calls.map(call => {
+        if (call.tool !== 'Read' || call.isRunning || call.isErrored || call.isInterrupted) return null
+        const path = (call.input as { file_path?: string } | undefined)?.file_path
+        return imageFor($, call.output, path)
+      }),
+    )
+    const images = found.filter((image): image is TReadImage => image !== null)
     if (images.length === 0) return next(e)
 
     const line = await next(e)
@@ -154,7 +181,7 @@ export const register: Register = on => {
       return next(e)
     }
 
-    const image = readImage(e.props.output, readPaths.get(e.props.tool_use_id))
+    const image = await imageFor($, e.props.output, readPaths.get(e.props.tool_use_id))
     if (!image) return next(e)
 
     const viewportColumns = e.viewport?.columns ?? READ_MAX_COLUMNS + MARGIN
